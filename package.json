@@ -1,0 +1,11 @@
+{
+  "name": "claw-hunt",
+  "private": true,
+  "workspaces": [
+    "apps/api"
+  ],
+  "scripts": {
+    "build": "npm run -w apps/api build",
+    "dev": "npm run -w apps/api dev"
+  }
+}

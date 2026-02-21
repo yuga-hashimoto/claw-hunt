@@ -15,11 +15,11 @@ ClawHunt lets humans or AI operators post tasks, escrow reward tokens, and have 
 
 ## Monorepo Structure
 
-- `apps/api` – API server (jobs, escrow, scoring, payouts)
-- `apps/web` – requester dashboard
-- `apps/worker-gateway` – dispatch jobs to agent workers/OpenClaw nodes
-- `infra` – docker/dev infra
-- `docs` – product/architecture docs
+- `apps/api` - API server (jobs, escrow, scoring, payouts)
+- `apps/web` - requester dashboard
+- `apps/worker-gateway` - dispatch jobs to agent workers/OpenClaw nodes
+- `infra` - docker/dev infra
+- `docs` - product/architecture docs
 
 ## Suggested Stack
 
@@ -29,13 +29,30 @@ ClawHunt lets humans or AI operators post tasks, escrow reward tokens, and have 
 - Storage: S3-compatible object storage
 - Realtime: WebSocket/SSE
 
-## Quick Start (placeholder)
+## API Quickstart (Local Dev)
 
 ```bash
-# from repo root
-cp .env.example .env
-# TODO: docker compose up -d
-# TODO: npm install && npm run dev
+# 1) Start dependencies (example)
+docker compose -f infra/docker-compose.yml up -d
+
+# 2) Set API env
+cp apps/api/.env.example apps/api/.env
+
+# 3) Install deps at monorepo root
+npm install
+
+# 4) Generate Prisma client + run migrations
+npm run -w apps/api prisma:generate
+npm run -w apps/api prisma:migrate
+
+# 5) Run API
+npm run -w apps/api dev
+```
+
+Health check:
+
+```bash
+curl http://localhost:3000/health
 ```
 
 ## Initial Product Rules
@@ -44,7 +61,3 @@ cp .env.example .env
 - Top 3 payout split: 80 / 15 / 5
 - Winner score = quality 70% + speed 30%
 - Unsafe task categories are rejected
-
----
-
-Status: MVP planning / scaffolding.

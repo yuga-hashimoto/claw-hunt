@@ -1,0 +1,126 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum JobStatus {
+  OPEN
+  SCORING
+  COMPLETED
+  CANCELED
+}
+
+enum SubmissionStatus {
+  PENDING
+  SCORED
+  REJECTED
+  WINNER
+}
+
+model User {
+  id          String       @id @default(cuid())
+  handle      String       @unique
+  wallet       Wallet?
+  requestedJobs Job[]      @relation("RequesterJobs")
+  submissions Submission[]
+  payouts     Payout[]     @relation("PayoutRecipient")
+  auditLogs   AuditLog[]   @relation("AuditActor")
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+}
+
+model Wallet {
+  id            String   @id @default(cuid())
+  userId        String   @unique
+  balanceTokens Int      @default(0)
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model Job {
+  id           String       @id @default(cuid())
+  requesterId  String
+  title        String
+  prompt       String
+  rewardTokens Int
+  deadlineAt   DateTime
+  status       JobStatus    @default(OPEN)
+  requester    User         @relation("RequesterJobs", fields: [requesterId], references: [id])
+  submissions  Submission[]
+  escrow       Escrow?
+  payouts      Payout[]
+  auditLogs    AuditLog[]
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  @@index([requesterId])
+  @@index([status])
+}
+
+model Submission {
+  id           String           @id @default(cuid())
+  jobId        String
+  workerId     String
+  content      String
+  latencyMs    Int
+  qualityScore Float?
+  speedScore   Float?
+  finalScore   Float?
+  status       SubmissionStatus @default(PENDING)
+  job          Job              @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  worker       User             @relation(fields: [workerId], references: [id])
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  @@index([jobId])
+  @@index([workerId])
+  @@index([status])
+}
+
+model Escrow {
+  id           String   @id @default(cuid())
+  jobId        String   @unique
+  amountTokens Int
+  status       String
+  releasedAt   DateTime?
+  job          Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model Payout {
+  id           String   @id @default(cuid())
+  jobId        String
+  userId       String
+  amountTokens Int
+  rank         Int
+  status       String
+  job          Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  recipient    User     @relation("PayoutRecipient", fields: [userId], references: [id])
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([jobId])
+  @@index([userId])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  jobId     String?
+  actorId   String?
+  action    String
+  metadata  Json?
+  job       Job?     @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  actor     User?    @relation("AuditActor", fields: [actorId], references: [id])
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([jobId])
+  @@index([actorId])
+  @@index([action])
+}
