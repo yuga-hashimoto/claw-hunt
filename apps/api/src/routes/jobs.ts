@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { JobStatus } from '@prisma/client';
+import { calculateSpeed, computeFinalScore, estimateQualityFromContent } from '../lib/scoring.js';
 
 const createJobSchema = z.object({
   title: z.string().min(3).max(200),
@@ -17,15 +18,14 @@ const createSubmissionSchema = z.object({
 
 const scoreSubmissionSchema = z.object({
   submissionId: z.string().min(1),
-  quality: z.number().min(0).max(1),
+  quality: z.number().min(0).max(1).optional(),
+});
+
+const settleJobSchema = z.object({
+  failAfterEscrowRelease: z.boolean().optional().default(false),
 });
 
 const SYSTEM_REQUESTER_HANDLE = 'system-requester';
-
-function calculateSpeed(latencyMs: number): number {
-  const normalized = 1 - latencyMs / 10000;
-  return Math.max(0, Math.min(1, normalized));
-}
 
 export default async function jobsRoutes(app: FastifyInstance): Promise<void> {
   app.post('/jobs', async (request, reply) => {
@@ -44,24 +44,10 @@ export default async function jobsRoutes(app: FastifyInstance): Promise<void> {
             create: { handle: SYSTEM_REQUESTER_HANDLE },
           },
         },
-        escrow: {
-          create: {
-            amountTokens: payload.rewardTokens,
-            status: 'LOCKED',
-          },
-        },
-        auditLogs: {
-          create: {
-            action: 'JOB_CREATED',
-            metadata: {
-              rewardTokens: payload.rewardTokens,
-            },
-          },
-        },
+        escrow: { create: { amountTokens: payload.rewardTokens, status: 'LOCKED' } },
+        auditLogs: { create: { action: 'JOB_CREATED', metadata: { rewardTokens: payload.rewardTokens } } },
       },
-      include: {
-        escrow: true,
-      },
+      include: { escrow: true },
     });
 
     return reply.status(201).send(job);
@@ -69,19 +55,11 @@ export default async function jobsRoutes(app: FastifyInstance): Promise<void> {
 
   app.get('/jobs/:id', async (request, reply) => {
     const params = z.object({ id: z.string().min(1) }).parse(request.params);
-
     const job = await app.prisma.job.findUnique({
       where: { id: params.id },
-      include: {
-        submissions: true,
-        escrow: true,
-      },
+      include: { submissions: true, escrow: true, payouts: true },
     });
-
-    if (!job) {
-      return reply.status(404).send({ error: 'JobNotFound' });
-    }
-
+    if (!job) return reply.status(404).send({ error: 'JobNotFound' });
     return reply.send(job);
   });
 
@@ -90,9 +68,7 @@ export default async function jobsRoutes(app: FastifyInstance): Promise<void> {
     const payload = createSubmissionSchema.parse(request.body);
 
     const job = await app.prisma.job.findUnique({ where: { id: params.id } });
-    if (!job) {
-      return reply.status(404).send({ error: 'JobNotFound' });
-    }
+    if (!job) return reply.status(404).send({ error: 'JobNotFound' });
 
     const worker = await app.prisma.user.upsert({
       where: { handle: payload.workerId },
@@ -114,10 +90,7 @@ export default async function jobsRoutes(app: FastifyInstance): Promise<void> {
         jobId: params.id,
         actorId: submission.workerId,
         action: 'SUBMISSION_CREATED',
-        metadata: {
-          submissionId: submission.id,
-          latencyMs: payload.latencyMs,
-        },
+        metadata: { submissionId: submission.id, latencyMs: payload.latencyMs },
       },
     });
 
@@ -129,27 +102,17 @@ export default async function jobsRoutes(app: FastifyInstance): Promise<void> {
     const payload = scoreSubmissionSchema.parse(request.body);
 
     const submission = await app.prisma.submission.findFirst({
-      where: {
-        id: payload.submissionId,
-        jobId: params.id,
-      },
+      where: { id: payload.submissionId, jobId: params.id },
     });
+    if (!submission) return reply.status(404).send({ error: 'SubmissionNotFound' });
 
-    if (!submission) {
-      return reply.status(404).send({ error: 'SubmissionNotFound' });
-    }
-
+    const quality = payload.quality ?? estimateQualityFromContent(submission.content);
     const speed = calculateSpeed(submission.latencyMs);
-    const score = payload.quality * 0.7 + speed * 0.3;
+    const score = computeFinalScore(quality, speed);
 
     const updated = await app.prisma.submission.update({
       where: { id: submission.id },
-      data: {
-        qualityScore: payload.quality,
-        speedScore: speed,
-        finalScore: score,
-        status: 'SCORED',
-      },
+      data: { qualityScore: quality, speedScore: speed, finalScore: score, status: 'SCORED' },
     });
 
     await app.prisma.auditLog.create({
@@ -157,21 +120,60 @@ export default async function jobsRoutes(app: FastifyInstance): Promise<void> {
         jobId: params.id,
         actorId: submission.workerId,
         action: 'SUBMISSION_SCORED',
-        metadata: {
-          submissionId: submission.id,
-          quality: payload.quality,
-          speed,
-          score,
-        },
+        metadata: { submissionId: submission.id, quality, speed, score },
       },
     });
 
-    return reply.send({
-      submission: updated,
-      score,
-      quality: payload.quality,
-      speed,
-      formula: 'quality*0.7 + speed*0.3',
+    return reply.send({ submission: updated, score, quality, speed, formula: 'quality*0.7 + speed*0.3' });
+  });
+
+  app.post('/jobs/:id/settle', async (request, reply) => {
+    const params = z.object({ id: z.string().min(1) }).parse(request.params);
+    const payload = settleJobSchema.parse(request.body ?? {});
+
+    const result = await app.prisma.$transaction(async (tx) => {
+      const job = await tx.job.findUnique({
+        where: { id: params.id },
+        include: {
+          escrow: true,
+          submissions: {
+            where: { status: 'SCORED' },
+            orderBy: { finalScore: 'desc' },
+            take: 3,
+          },
+        },
+      });
+
+      if (!job || !job.escrow) throw new Error('JobOrEscrowNotFound');
+      if (job.submissions.length === 0) throw new Error('NoScoredSubmissions');
+
+      const splits = [0.8, 0.15, 0.05];
+      const payouts = job.submissions.map((s, idx) => ({
+        jobId: job.id,
+        userId: s.workerId,
+        amountTokens: Math.floor(job.rewardTokens * splits[idx]!),
+        rank: idx + 1,
+        status: 'PAID',
+      }));
+
+      await tx.escrow.update({ where: { jobId: job.id }, data: { status: 'RELEASED', releasedAt: new Date() } });
+
+      if (payload.failAfterEscrowRelease) throw new Error('SimulatedFailureAfterEscrowRelease');
+
+      await tx.payout.createMany({ data: payouts });
+      await tx.submission.update({ where: { id: job.submissions[0]!.id }, data: { status: 'WINNER' } });
+      await tx.job.update({ where: { id: job.id }, data: { status: JobStatus.COMPLETED } });
+      await tx.auditLog.create({
+        data: {
+          jobId: job.id,
+          action: 'JOB_SETTLED',
+          metadata: { winnerSubmissionId: job.submissions[0]!.id, payouts },
+        },
+      });
+
+      return { jobId: job.id, payoutsCount: payouts.length, winnerSubmissionId: job.submissions[0]!.id };
     });
+
+    return reply.send(result);
   });
 }

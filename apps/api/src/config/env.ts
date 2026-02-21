@@ -5,6 +5,7 @@ const envSchema = z.object({
   PORT: z.coerce.number().int().positive().default(3000),
   DATABASE_URL: z.string().min(1),
   REDIS_URL: z.string().url(),
+  API_KEY: z.string().min(8).optional(),
 });
 
 const parsed = envSchema.safeParse(process.env);
